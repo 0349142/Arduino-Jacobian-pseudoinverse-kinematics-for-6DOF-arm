@@ -1,0 +1,205 @@
+#include <AccelStepper.h>
+#include <BasicLinearAlgebra.h> // For matrix operations
+
+using namespace BLA;
+
+// Define stepper motors (DIR, STEP)
+AccelStepper stepper1(AccelStepper::DRIVER, 2, 3);  // Base (NEMA 23, Joint 1): My specificaations.
+AccelStepper stepper2(AccelStepper::DRIVER, 4, 5);  // Shoulder (NEMA 34, Joint 2)
+AccelStepper stepper3(AccelStepper::DRIVER, 6, 7);  // Link 2 (NEMA 23, Joint 3)
+AccelStepper stepper4(AccelStepper::DRIVER, 8, 9);  // Wrist Yaw (NEMA 23, Joint 4)
+AccelStepper stepper5(AccelStepper::DRIVER, 10, 11); // Wrist Pitch (NEMA 17, Joint 5)
+AccelStepper stepper6(AccelStepper::DRIVER, 12, 13); // Wrist Roll (NEMA 17, Joint 6)
+
+// Arm geometry (in mm) change based on your own robtic arm geometry.
+const float L1 = 700.0; // Link 1 length
+const float L2 = 200.0; // Link 2 length
+const float L3 = 200.0; // Wrist yaw to pitch link
+const float L4 = 20.0;  // Wrist pitch to roll link (end effector)
+
+// Steps per degree for each motor
+const float STEPS_PER_DEGREE[] = {400.0, 200.0, 400.0, 200.0, 100.0, 100.0};
+
+// Joint angle limits (in degrees) should most likely work for your robot but still check.
+const float MIN_ANGLE[] = {-180, -90, -90, -180, -90, -180};
+const float MAX_ANGLE[] = {180, 90, 90, 180, 90, 180};
+
+// Pseudoinverse Jacobian parameters
+const float THRESHOLD = 0.001; // Convergence threshold
+const int MAX_ITERATIONS = 100; // Max iterations for IK solver
+const float LAMBDA = 0.01; // Damping factor for stability
+
+// Function prototypes
+void calculateForwardKinematics(float* angles, float* position);
+void calculateJacobian(float* angles, BLA::Matrix<6, 6>& J);
+bool solveIK(float* target, float* currentAngles, float* resultAngles);
+void moveToAngles(float* angles);
+void moveToTargetSmoothly(float* currentAngles, float* targetAngles, int steps);
+
+void setup() {
+    Serial.begin(115200);
+
+    // Initialize stepper motors
+    stepper1.setMaxSpeed(1000);
+    stepper1.setAcceleration(500);
+    stepper2.setMaxSpeed(800);
+    stepper2.setAcceleration(400);
+    stepper3.setMaxSpeed(1000);
+    stepper3.setAcceleration(500);
+    stepper4.setMaxSpeed(800);
+    stepper4.setAcceleration(400);
+    stepper5.setMaxSpeed(600);
+    stepper5.setAcceleration(300);
+    stepper6.setMaxSpeed(600);
+    stepper6.setAcceleration(300);
+}
+
+void loop() {
+    if (Serial.available() > 0) {
+        // Read target position from serial
+        float target[6]; // x, y, z, roll, pitch, yaw
+        for (int i = 0; i < 6; i++) {
+            target[i] = Serial.parseFloat();
+        }
+        if (Serial.read() == '\n') {
+            // Current joint angles (initial guess)
+            float currentAngles[6] = {0, 0, 0, 0, 0, 0};
+
+            // Solve IK for target angles
+            float targetAngles[6];
+            if (solveIK(target, currentAngles, targetAngles)) {
+                // Move smoothly to target angles
+                moveToTargetSmoothly(currentAngles, targetAngles, 100);
+            } else {
+                Serial.println("IK solution not found.");
+            }
+        }
+    }
+}
+
+// Forward kinematics to compute the current end-effector position and orientation
+void calculateForwardKinematics(float* angles, float* position) {
+    float theta1 = radians(angles[0]);
+    float theta2 = radians(angles[1]);
+    float theta3 = radians(angles[2]);
+
+    float r = L1 * cos(theta2) + L2 * cos(theta2 + theta3);
+    position[0] = r * cos(theta1); // x
+    position[1] = r * sin(theta1); // y
+    position[2] = L1 * sin(theta2) + L2 * sin(theta2 + theta3); // z
+    position[3] = angles[3]; // roll
+    position[4] = angles[4]; // pitch
+    position[5] = angles[5]; // yaw
+}
+
+// Compute the Jacobian matrix
+void calculateJacobian(float* angles, BLA::Matrix<6, 6>& J) {
+    float theta1 = radians(angles[0]);
+    float theta2 = radians(angles[1]);
+    float theta3 = radians(angles[2]);
+
+    float c1 = cos(theta1), s1 = sin(theta1);
+    float c2 = cos(theta2), s2 = sin(theta2);
+    float c23 = cos(theta2 + theta3), s23 = sin(theta2 + theta3);
+
+    // Partial derivatives of position (x, y, z)
+    J(0, 0) = -L1 * c2 * s1 - L2 * c23 * s1; // ∂x/∂θ1
+    J(1, 0) = L1 * c2 * c1 + L2 * c23 * c1;  // ∂y/∂θ1
+    J(2, 0) = 0;                             // ∂z/∂θ1
+
+    J(0, 1) = -s2 * c1 * L1 - s23 * c1 * L2; // ∂x/∂θ2
+    J(1, 1) = -s2 * s1 * L1 - s23 * s1 * L2; // ∂y/∂θ2
+    J(2, 1) = L1 * c2 + L2 * c23;            // ∂z/∂θ2
+
+    J(0, 2) = -s23 * c1 * L2;                // ∂x/∂θ3
+    J(1, 2) = -s23 * s1 * L2;                // ∂y/∂θ3
+    J(2, 2) = L2 * c23;                      // ∂z/∂θ3
+
+    // Orientation (roll, pitch, yaw)
+    J(3, 3) = 1.0;
+    J(4, 4) = 1.0;
+    J(5, 5) = 1.0;
+}
+
+// Solve inverse kinematics using the pseudoinverse Jacobian
+bool solveIK(float* target, float* currentAngles, float* resultAngles) {
+    float position[6];
+    BLA::Matrix<6, 6> J; // Jacobian matrix
+    BLA::Matrix<6> deltaTheta;
+    BLA::Matrix<6> error;
+
+    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+        // Calculate forward kinematics
+        calculateForwardKinematics(currentAngles, position);
+
+        // Calculate error (target - current position)
+        for (int i = 0; i < 6; i++) {
+            error(i) = target[i] - position[i];
+        }
+
+        // Check if the error is within the threshold
+        if (error.NormFrobenius() < THRESHOLD) {
+            for (int i = 0; i < 6; i++) {
+                resultAngles[i] = currentAngles[i];
+            }
+            return true;
+        }
+
+        // Compute the Jacobian
+        calculateJacobian(currentAngles, J);
+
+        // Compute the pseudoinverse Jacobian
+        BLA::Matrix<6, 6> J_inv = ~J * (J * ~J + LAMBDA * LAMBDA * Identity<6>()).Inverse();
+
+        // Update joint angles
+        deltaTheta = J_inv * error;
+        for (int i = 0; i < 6; i++) {
+            currentAngles[i] += deltaTheta(i);
+            currentAngles[i] = constrain(currentAngles[i], MIN_ANGLE[i], MAX_ANGLE[i]);
+        }
+    }
+    return false; // If no solution found within max iterations
+}
+
+// Move the steppers to calculated angles
+void moveToAngles(float* angles) {
+    long steps[6];
+    for (int i = 0; i < 6; i++) {
+        steps[i] = angles[i] * STEPS_PER_DEGREE[i];
+    }
+
+    // Set target positions
+    stepper1.moveTo(steps[0]);
+    stepper2.moveTo(steps[1]);
+    stepper3.moveTo(steps[2]);
+    stepper4.moveTo(steps[3]);
+    stepper5.moveTo(steps[4]);
+    stepper6.moveTo(steps[5]);
+
+    // Move all steppers
+    while (stepper1.distanceToGo() != 0 ||
+           stepper2.distanceToGo() != 0 ||
+           stepper3.distanceToGo() != 0 ||
+           stepper4.distanceToGo() != 0 ||
+           stepper5.distanceToGo() != 0 ||
+           stepper6.distanceToGo() != 0) {
+        stepper1.run();
+        stepper2.run();
+        stepper3.run();
+        stepper4.run();
+        stepper5.run();
+        stepper6.run();
+    }
+}
+
+// Smoothly move to the target angles
+void moveToTargetSmoothly(float* currentAngles, float* targetAngles, int steps) {
+    float interpolatedAngles[6];
+    for (int i = 0; i <= steps; i++) {
+        for (int j = 0; j < 6; j++) {
+            interpolatedAngles[j] = currentAngles[j] + (targetAngles[j] - currentAngles[j]) * i / steps;
+        }
+        moveToAngles(interpolatedAngles);
+        delay(10); // Adjust delay for smoother movement if necessary
+    }
+}
